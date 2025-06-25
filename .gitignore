@@ -30,3 +30,28 @@ __pycache__/
 
 
 
+
+##############################################################################
+# Build / CI / generated stuff we never want to track
+##############################################################################
+# CMake output
+build/
+CMakePresets.json
+
+# auto-generated python + codegen
+codegen/
+__pycache__/
+
+# run-time data sets
+odd_output/
+*.csv
+*.root
+*.obj
+
+# GitHub + CI plumbing
+.github/
+CI/
+
+# (ACTS main repo already tracks Core/, Examples/, etc.
+#  The floods you saw were *copies* left over from aborted rebase;
+#  they match upstream and don’t belong in your branch.)
