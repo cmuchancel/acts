@@ -15,3 +15,18 @@ timing.tsv
 
 # keep reference test CSVs
 !Tests/Data/*.csv
+.github/
+
+CI/
+build/
+
+codegen/
+
+__pycache__/
+
+*.root
+
+
+
+
+
