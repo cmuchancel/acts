@@ -13,6 +13,9 @@ from acts.examples import (
     RootParticleWriter,
 )
 
+import sys
+print(">>> simulation.py running, argv:", sys.argv)
+
 # Defaults (given as `None` here) use class defaults defined in
 # Examples/Algorithms/Generators/ActsExamples/Generators/ParametricParticleGenerator.hpp
 MomentumConfig = namedtuple(

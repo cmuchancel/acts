@@ -1,43 +1,17 @@
-installed
-*~*
-._*
-#cmt
-cmt/*.sh
-cmt/Make*
-cmt/install*
-cmt/*.csh
-=======
-# temporary Athena files
-# ======================
-InstallArea
-WorkArea
-genConf
-x86_64-slc6-gcc48-opt
-x86_64-slc6-gcc49-opt
-.*
-build*
-.asetup.save
 
-# do not ignore changes in the requirements file
-# as they are actually important
-!cmt/requirements
+odd_output/
+Detectors/GenericDetector/odd_output/
 
-# doxygen documentation
-# =====================
-!doc/doxygen.config
+codegen/src/codegen.egg-info/
 
-#json output
-*.json
-#root output
-*.root
-*.pyc
-/cmake_cmd
-/cleanup.sh
+nohup.out
 
-# dont ignore hidden configs
-!.clang-format
-!.github/
-!.gitignore
-!.gitlab-ci.yml
-!.clang-tidy
-!.oclint
+*.csv
+
+*.obj
+
+timing.tsv
+
+
+# keep reference test CSVs
+!Tests/Data/*.csv

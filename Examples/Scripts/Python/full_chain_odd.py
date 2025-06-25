@@ -54,7 +54,7 @@ geoDir = getOpenDataDetectorDirectory()
 outputDir = pathlib.Path.cwd() / "odd_output"
 # acts.examples.dump_args_calls(locals())  # show python binding calls
 
-oddMaterialMap = geoDir / "data/odd-material-maps.root"
+oddMaterialMap = geoDir /"/eos/user/c/clavoie/acts/thirdparty/OpenDataDetector/data/odd-material-maps.root"
 oddDigiConfig = geoDir / "config/odd-digi-smearing-config.json"
 oddSeedingSel = geoDir / "config/odd-seeding-config.json"
 oddMaterialDeco = acts.IMaterialDecorator.fromFile(oddMaterialMap)
