@@ -35,6 +35,7 @@ import time
 import re
 import json
 import math
+from typing import Dict, List
 import subprocess
 import uproot
 import pathlib
@@ -52,28 +53,47 @@ from xopt.generators.bayesian import UpperConfidenceBoundGenerator
 from mpi4py.futures import MPIPoolExecutor
 completed = 0
 # ------------------------------------------------------------------
-# CKF hyper‑parameter search space
+# CKF hyper‑parameter search space (bounds)
 # ------------------------------------------------------------------
 VOCS_CKF = VOCS(
     variables={
         # name                lower  upper
-        "maxSeedsPerSpM":   ( 5,     30),
-        "cotThetaMax":      ( 0.5,   3.0),
-        "sigmaScattering":  ( 0.1,   10.0),
-        "radLengthPerSeed": ( 0.1,   4.0),
-        "impactMax":        ( 0.1,  3.0),
-        "maxPtScattering":  ( 1.0,  50.0),
-        "deltaRMin":        ( 0.0,   3.0),
-        "deltaRMax":        ( 3.0,  300.0),
+        "maxSeedsPerSpM": (5, 30),
+        "cotThetaMax": (0.5, 3.0),
+        "sigmaScattering": (0.1, 10.0),
+        "radLengthPerSeed": (0.1, 4.0),
+        "impactMax": (0.1, 3.0),
+        "maxPtScattering": (1.0, 50.0),
+        "deltaRMin": (0.0, 3.0),
+        "deltaRMax": (3.0, 300.0),
     },
     objectives={"score": "MINIMIZE"},
 )
 
 # ------------------------------------------------------------------
+# Default values used whenever a variable *is not* optimised
+# ------------------------------------------------------------------
+DEFAULT_CKF_PARAMS: Dict[str, float] = {
+    "maxSeedsPerSpM": 12,
+    "cotThetaMax": 1.5,
+    "sigmaScattering": 2.0,
+    "radLengthPerSeed": 1.0,
+    "impactMax": 1.5,
+    "maxPtScattering": 10.0,
+    "deltaRMin": 0.5,
+    "deltaRMax": 100.0,
+}
+# ------------------------------------------------------------------
 # Wrapper around ckf.py: takes a *dict* of parameters, returns *dict*
 # ------------------------------------------------------------------
 
 def evaluate_ckf(params: dict) -> dict:
+    """Run a single CKF benchmark with the supplied hyper‑parameters."""
+
+    # Fill in any parameters that were NOT optimised with defaults
+    full_params = DEFAULT_CKF_PARAMS.copy()
+    full_params.update(params)
+
     rank = MPI.COMM_WORLD.Get_rank()
     now  = datetime.now().strftime("%H:%M:%S.%f")[:12]
     print(f"{now}  R{rank} START", flush=True)
@@ -154,7 +174,34 @@ def main(argv=None):
     ap.add_argument("--n-guided-trials", type=int, default=50,
                     help="Number of optimisation iterations *after* the seeds")
     ap.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("xopt_out"))
+    ap.add_argument(
+        "--opt-vars",
+        default="all",
+        help=(
+            "Comma‑separated list of CKF variables to optimise. "
+            f"Choices: {', '.join(VOCS_CKF.variables.keys())}; "
+            "use 'all' to optimise every variable."
+        ),
+    )
     args = ap.parse_args(argv)
+
+    if args.opt_vars.lower() == "all":
+        opt_vars = list(VOCS_CKF.variables.keys())
+    else:
+        opt_vars = [v.strip() for v in args.opt_vars.split(",") if v.strip()]
+        bad = set(opt_vars) - VOCS_CKF.variables.keys()
+        if bad:
+            ap.error(f"Unknown CKF variable(s): {', '.join(sorted(bad))}")
+
+    global OPT_VARS
+    OPT_VARS = set(opt_vars)  # make visible to evaluate_ckf
+    if MPI.COMM_WORLD.Get_rank() == 0:
+        print("[rank-0] optimiser will vary →", sorted(opt_vars))
+    # ---------- build a VOCS subset ----------
+    vocs_subset = VOCS(
+        variables={k: VOCS_CKF.variables[k] for k in opt_vars},
+        objectives=VOCS_CKF.objectives,
+    )
 
     n_seed     = args.n_seed_trials
     n_guided   = args.n_guided_trials
@@ -168,11 +215,11 @@ def main(argv=None):
         executor=pool
     )
     generator = UpperConfidenceBoundGenerator(
-        vocs=VOCS_CKF,
+        vocs=vocs_subset,
         n_candidates=4
     )
 
-    X = xopt.Xopt(evaluator=evaluator, generator=generator, vocs=VOCS_CKF)
+    X = xopt.Xopt(evaluator=evaluator, generator=generator, vocs=vocs_subset)
 
     # ---------- rank-0 drives the optimisation ----------
     if MPI.COMM_WORLD.Get_rank() == 0:
