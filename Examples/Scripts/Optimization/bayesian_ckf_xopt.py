@@ -40,14 +40,17 @@ import uproot
 import pathlib
 import pandas as pd
 from datetime import datetime
+import numpy as np
+import matplotlib.pyplot as plt
 from mpi4py import MPI
+print(f"[DEBUG] world size = {MPI.COMM_WORLD.Get_size()}, rank = {MPI.COMM_WORLD.Get_rank()}")
 
 import xopt
 from xopt.vocs import VOCS
 from xopt.evaluator import Evaluator
 from xopt.generators.bayesian import UpperConfidenceBoundGenerator
 from mpi4py.futures import MPIPoolExecutor
-
+completed = 0
 # ------------------------------------------------------------------
 # CKF hyper‑parameter search space
 # ------------------------------------------------------------------
@@ -71,6 +74,11 @@ VOCS_CKF = VOCS(
 # ------------------------------------------------------------------
 
 def evaluate_ckf(params: dict) -> dict:
+    rank = MPI.COMM_WORLD.Get_rank()
+    now  = datetime.now().strftime("%H:%M:%S.%f")[:12]
+    print(f"{now}  R{rank} START", flush=True)
+    global completed
+    print(f"[worker rank {MPI.COMM_WORLD.Get_rank()}] running CKF with {params}")
     workdir = pathlib.Path(tempfile.mkdtemp(prefix="ckf_run_"))
     ckf_args = [
         f"--sf_{k}={int(round(v))}" if k == "maxSeedsPerSpM" else f"--sf_{k}={v}"
@@ -123,7 +131,10 @@ def evaluate_ckf(params: dict) -> dict:
             k_dup, k_time = 7, 7
             penalty = fake + dup / k_dup + run_time / k_time
             score = -(eff - penalty)   # negate → MINIMIZE
-
+        completed += 1
+        now = datetime.now().strftime("%H:%M:%S.%f")[:12]
+        print(f"{now}  R{rank} DONE ", flush=True)
+        print(f"[R{MPI.COMM_WORLD.Get_rank()}] done → {completed}", flush=True)
         return {"score": score}
 
     except Exception as exc:
@@ -138,9 +149,15 @@ def evaluate_ckf(params: dict) -> dict:
 # ------------------------------------------------------------------
 def main(argv=None):
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--n-trials", type=int, default=50, help="Total optimisation iterations")
+    ap.add_argument("--n-seed-trials", type=int, default=5,
+                    help="Number of initial random evaluations (warm-up)")
+    ap.add_argument("--n-guided-trials", type=int, default=50,
+                    help="Number of optimisation iterations *after* the seeds")
     ap.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("xopt_out"))
     args = ap.parse_args(argv)
+
+    n_seed     = args.n_seed_trials
+    n_guided   = args.n_guided_trials
 
     outdir: pathlib.Path = args.output_dir
     outdir.mkdir(parents=True, exist_ok=True)
@@ -150,25 +167,68 @@ def main(argv=None):
         function=evaluate_ckf,
         executor=pool
     )
-    generator = UpperConfidenceBoundGenerator(vocs=VOCS_CKF)
+    generator = UpperConfidenceBoundGenerator(
+        vocs=VOCS_CKF,
+        n_candidates=4
+    )
+
     X = xopt.Xopt(evaluator=evaluator, generator=generator, vocs=VOCS_CKF)
 
     # ---------- rank-0 drives the optimisation ----------
     if MPI.COMM_WORLD.Get_rank() == 0:
-        X.random_evaluate(5)
-        for _ in range(args.n_trials):
-            X.step()
+        X.random_evaluate(n_seed)
 
+        # total guided evaluations = args.n_trials
+        while len(X.data) < n_seed + n_guided:
+            X.step() 
+        # ---------- persist results --------------------------------
+           # each step spawns 4 CKF runs
         csv_path = outdir / "history.csv"
         X.data.to_csv(csv_path, index=False)
 
         with open(outdir / "xopt_state.json", "w") as fh:
             fh.write(X.model_dump_json(indent=2))
+        # ---------- plotting ---------------------------------------
+        df = X.data.copy().reset_index(drop=True)
+        df["trial"] = df.index
+        # invert for plotting, map failed 1.0 → 0.0
+        df["inv_score"] = np.where(df["score"] == 1.0, 0.0, -df["score"])
+        seed_mask = df["trial"] < n_seed
 
-        best = X.data.loc[X.data["score"].idxmin()]
-        print(f"✅ Optimisation finished. Results in {outdir}")
-        print(f"Best parameters →\n{best.to_dict()}")
+        # line should connect only non‑zero points
+        line_mask = df["inv_score"] > 0.0
+        plt.figure(figsize=(8, 4))
+        plt.plot(
+            df.loc[line_mask, "trial"],
+            df.loc[line_mask, "inv_score"],
+            marker="o",
+            linewidth=1.5,
+            label="successful trials",
+        )
+        # scatter all points, colouring seeds separately
+        plt.scatter(df["trial"], df["inv_score"], color="blue", zorder=4)
+        plt.scatter(
+            df.loc[seed_mask, "trial"],
+            df.loc[seed_mask, "inv_score"],
+            color="red",
+            zorder=5,
+            label="seed trials (first 5)",
+        )
+        plt.xlabel("Trial number")
+        plt.ylabel("Inverted score (higher is better)")
+        plt.title("Inverted score vs Trial number — CKF optimisation")
+        plt.legend()
+        plt.tight_layout()
+        png_path = outdir / "score_vs_trial.png"
+        plt.savefig(png_path, dpi=150)
+        plt.close()
+
+        # ---------- console summary -------------------------------
+        best_row = df.loc[df["inv_score"].idxmax()]
+        print(f"✅i Optimisation finished. Results in {outdir}")
+        print(f"Best parameters →\n{best_row.to_dict()}")
         print(f"History saved to {csv_path}")
+        print(f"Plot saved to   {png_path}")
 
 
 if __name__ == "__main__":  # pragma: no cover
