@@ -51,6 +51,7 @@ from xopt.vocs import VOCS
 from xopt.evaluator import Evaluator
 from xopt.generators.bayesian import UpperConfidenceBoundGenerator
 from mpi4py.futures import MPIPoolExecutor
+GEOMETRY = "generic"
 completed = 0
 # ------------------------------------------------------------------
 # CKF hyper‑parameter search space (bounds)
@@ -104,7 +105,10 @@ def evaluate_ckf(params: dict) -> dict:
         f"--sf_{k}={int(round(v))}" if k == "maxSeedsPerSpM" else f"--sf_{k}={v}"
         for k, v in params.items()
     ]
-    cli = ["python", "ckf.py", "--nEvents=1", f"--output={workdir}", *ckf_args]
+
+    if GEOMETRY == "odd":
+        ckf_args.append("--sf_ptMin=1.0")
+    cli = ["python", "ckf.py", "--nEvents=1",f"--geometry={GEOMETRY}",  f"--output={workdir}", *ckf_args]
 
     cmd = ["python", "ckf.py", "--nEvents=1",
            f"--output={workdir}", *ckf_args]
@@ -137,7 +141,7 @@ def evaluate_ckf(params: dict) -> dict:
                 run_time = time.perf_counter() - t0
         # ---- pull metrics ----------------------------------------
         with uproot.open(workdir / "performance_seeding.root") as rh:
-            eff   = rh["eff_particles"].member("fElements")[0]
+            eff   = rh["eff_tracks"].member("fElements")[0]
             fake  = rh["fakeratio_tracks"].member("fElements")[0]
             dup   = rh["duplicateratio_tracks"].member("fElements")[0]
 
@@ -178,12 +182,30 @@ def main(argv=None):
         "--opt-vars",
         default="all",
         help=(
-            "Comma‑separated list of CKF variables to optimise. "
+            "Comma seperated list of CKF variables to optimise. "
             f"Choices: {', '.join(VOCS_CKF.variables.keys())}; "
             "use 'all' to optimise every variable."
         ),
     )
+
+    # -------------- NEW FLAGS ----------------------------------------
+    ap.add_argument(
+        "--data-file",
+        type=pathlib.Path,
+        default=None,
+        help="ROOT file or directory produced with ACTS simulation (optional)",
+    )
+    ap.add_argument(
+        "--geometry",
+        choices=["generic", "odd", "itk"],
+        default="generic",
+        help="Detector geometry to reconstruct with",
+    )
+
     args = ap.parse_args(argv)
+
+    global GEOMETRY
+    GEOMETRY = args.geometry
 
     if args.opt_vars.lower() == "all":
         opt_vars = list(VOCS_CKF.variables.keys())
