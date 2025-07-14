@@ -7,6 +7,10 @@ import argparse
 import acts
 from acts import UnitConstants as u
 from acts.examples import GenericDetector, RootParticleReader
+from acts.examples.odd import (
+    getOpenDataDetector,
+    getOpenDataDetectorDirectory,
+)
 
 
 def getArgumentParser():
@@ -19,6 +23,14 @@ def getArgumentParser():
         help="Directory with input root files",
         default="./",
     )
+
+    parser.add_argument(
+        "--geometry",
+        choices=["generic", "odd"],
+        default="generic",
+        help="Detector geometry to use",
+    )
+
     parser.add_argument(
         "-o",
         "--output",
@@ -86,6 +98,14 @@ def getArgumentParser():
         default=60.0,
     )
 
+    # new: geometry‑dependent minimum pT --------------------------------------
+    parser.add_argument(
+        "--sf_minPt",
+        type=float,
+        default=None,
+        help="Minimum pT for seeding [GeV] – overrides geometry defaults",
+    )
+
     return parser
 
 
@@ -110,6 +130,7 @@ def runCKFTracks(
     MaxPtScattering=10.0,
     DeltaRMin=1.0,
     DeltaRMax=60.0,
+    MinPt=0.5,
 ):
     from acts.examples.simulation import (
         addParticleGun,
@@ -216,7 +237,7 @@ def runCKFTracks(
             sigmaScattering=SigmaScattering,
             radLengthPerSeed=RadLengthPerSeed,
             maxPtScattering=MaxPtScattering * u.GeV,
-            minPt=500 * u.MeV,
+            minPt= MinPt * u.GeV,
             impactMax=ImpactMax * u.mm,
         ),
         SeedFinderOptionsArg(bFieldInZ=2 * u.T, beamPos=(0.0, 0, 0)),
@@ -260,14 +281,46 @@ def runCKFTracks(
 if "__main__" == __name__:
     options = getArgumentParser().parse_args()
 
+    geometry_choice = options.geometry
+
     Inputdir = options.indir
     Outputdir = options.outdir
 
     srcdir = Path(__file__).resolve().parent.parent.parent.parent
 
-    detector = GenericDetector()
+    # ------------------------------------------------------------------
+    # Geometry‑specific setup
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Geometry selection
+    # ------------------------------------------------------------------
+    if options.geometry == "generic":
+        detector = GenericDetector()
+        default_minPt = 0.5  # GeV
+        base_cfg_dir = Path(__file__).resolve().parents[3] / "Examples" / "Configs"
+        geo_cfg = base_cfg_dir / "generic-seeding-config.json"
+        digi_cfg     = base_cfg_dir / "generic-digi-smearing-config.json"
+    else:  # ODD -------------------------------------------------------------
+        odd_dir      = Path(getOpenDataDetectorDirectory())
+        material_map = odd_dir / "data" / "odd-material-maps.root"
+        mat_deco     = acts.IMaterialDecorator.fromFile(material_map)
+
+        detector     = getOpenDataDetector(odd_dir=odd_dir,
+                                        materialDecorator=mat_deco)  # identical to full_chain_odd
+        default_pt   = 1.0  # GeV
+
+        acts_dir     = Path(__file__).resolve().parents[3]
+        geo_cfg      = acts_dir / "Examples/Configs/odd-seeding-config.json"
+        digi_cfg     = acts_dir / "Examples/Configs/odd-digi-smearing-config.json"
+
     trackingGeometry = detector.trackingGeometry()
-    decorators = detector.contextDecorators()
+    decorators        = detector.contextDecorators()
+
+    # ------------------------------------------------------------------
+    # Resolve min‑pT cut
+    # ------------------------------------------------------------------
+    minPt_cut = options.sf_minPt if options.sf_minPt is not None else default_minPt
 
     field = acts.ConstantBField(acts.Vector3(0, 0, 2 * u.T))
 
@@ -279,8 +332,8 @@ if "__main__" == __name__:
         trackingGeometry,
         decorators,
         field=field,
-        geometrySelection=srcdir / "Examples/Configs/generic-seeding-config.json",
-        digiConfigFile=srcdir / "Examples/Configs/generic-digi-smearing-config.json",
+        geometrySelection = geo_cfg,
+        digiConfigFile= digi_cfg,
         outputCsv=True,
         truthSmearedSeeded=False,
         truthEstimatedSeeded=False,
@@ -295,4 +348,5 @@ if "__main__" == __name__:
         MaxPtScattering=options.sf_maxPtScattering,
         DeltaRMin=options.sf_deltaRMin,
         DeltaRMax=options.sf_deltaRMax,
+        MinPt=minPt_cut
     ).run()

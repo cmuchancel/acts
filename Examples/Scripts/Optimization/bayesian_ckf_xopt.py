@@ -44,6 +44,7 @@ from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
+from functools import partial 
 print(f"[DEBUG] world size = {MPI.COMM_WORLD.Get_size()}, rank = {MPI.COMM_WORLD.Get_rank()}")
 
 import xopt
@@ -51,8 +52,8 @@ from xopt.vocs import VOCS
 from xopt.evaluator import Evaluator
 from xopt.generators.bayesian import UpperConfidenceBoundGenerator
 from mpi4py.futures import MPIPoolExecutor
-GEOMETRY = "generic"
 completed = 0
+GEOMETRY = "generic" 
 # ------------------------------------------------------------------
 # CKF hyper‑parameter search space (bounds)
 # ------------------------------------------------------------------
@@ -107,7 +108,7 @@ def evaluate_ckf(params: dict) -> dict:
     ]
 
     if GEOMETRY == "odd":
-        ckf_args.append("--sf_ptMin=1.0")
+        ckf_args.append("--sf_minPt=1.0")
     cli = ["python", "ckf.py", "--nEvents=1",f"--geometry={GEOMETRY}",  f"--output={workdir}", *ckf_args]
 
     cmd = ["python", "ckf.py", "--nEvents=1",
@@ -197,15 +198,19 @@ def main(argv=None):
     )
     ap.add_argument(
         "--geometry",
-        choices=["generic", "odd", "itk"],
+        choices=["generic", "odd"],
         default="generic",
         help="Detector geometry to reconstruct with",
     )
 
     args = ap.parse_args(argv)
 
+    # ---- share geometry string across all MPI ranks ----------------
+    geom_str = args.geometry if MPI.COMM_WORLD.Get_rank() == 0 else None
+    geom_str = MPI.COMM_WORLD.bcast(geom_str, root=0)
+
     global GEOMETRY
-    GEOMETRY = args.geometry
+    GEOMETRY = geom_str
 
     if args.opt_vars.lower() == "all":
         opt_vars = list(VOCS_CKF.variables.keys())
