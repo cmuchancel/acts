@@ -45,15 +45,24 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
 from functools import partial 
-print(f"[DEBUG] world size = {MPI.COMM_WORLD.Get_size()}, rank = {MPI.COMM_WORLD.Get_rank()}")
+from pathlib import Path
+#print(f"[DEBUG] world size = {MPI.COMM_WORLD.Get_size()}, rank = {MPI.COMM_WORLD.Get_rank()}")
 
 import xopt
 from xopt.vocs import VOCS
 from xopt.evaluator import Evaluator
 from xopt.generators.bayesian import UpperConfidenceBoundGenerator
 from mpi4py.futures import MPIPoolExecutor
-completed = 0
-GEOMETRY = "generic" 
+
+
+# ---------------------------------------------------------------------------
+# Globals & constants
+# ---------------------------------------------------------------------------
+DEFAULT_GEOMETRY = "generic"
+COMPLETED_TRIALS: int = 0  # updated inside workers
+GEOMETRY: str = DEFAULT_GEOMETRY  # broadcast from rank‑0 at runtime
+VERBOSE: bool = False             # set from CLI
+
 # ------------------------------------------------------------------
 # CKF hyper‑parameter search space (bounds)
 # ------------------------------------------------------------------
@@ -85,6 +94,90 @@ DEFAULT_CKF_PARAMS: Dict[str, float] = {
     "deltaRMin": 0.5,
     "deltaRMax": 100.0,
 }
+
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse and return command‑line arguments.
+
+    Parameters
+    ----------
+    argv : list[str] | None
+        Optional list of CLI tokens (use `None` for `sys.argv[1:]`).
+
+    Returns
+    -------
+    argparse.Namespace
+        Parsed arguments.
+    """
+    parser = argparse.ArgumentParser(
+        description="Bayesian optimisation of CKF hyper‑parameters with Xopt.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Optimisation hyper‑parameters
+    parser.add_argument(
+        "--n-seed-trials",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Number of initial random evaluations (warm‑up).",
+    )
+    parser.add_argument(
+        "--n-guided-trials",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Number of Bayesian‑optimisation iterations after the seed phase.",
+    )
+
+    # File‑system options
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("xopt_out"),
+        metavar="DIR",
+        help="Directory in which to store optimiser outputs.",
+    )
+
+    # Optimisation variable control
+    parser.add_argument(
+        "--opt-vars",
+        default="all",
+        metavar="VARS",
+        help=(
+            "Comma‑separated list of CKF variables to optimise "
+            f"(choices: {', '.join(VOCS_CKF.variables.keys())}; "
+            "use 'all' to optimise every variable)."
+        ),
+    )
+
+    # Reconstruction options
+    parser.add_argument(
+        "--geometry",
+        choices=["generic", "odd"],
+        default=DEFAULT_GEOMETRY,
+        help="Detector geometry to reconstruct with.",
+    )
+
+    # Verbosity flag
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show detailed per‑trial logs and diagnostics.",
+    )
+
+    return parser.parse_args(argv)
+
+def vprint(*args, **kwargs) -> None:  # noqa: D401 – simple wrapper
+    """Verbose print – emits only if global ``VERBOSE`` is *True*."""
+    if VERBOSE:
+        print(*args, **kwargs)
+
+
 # ------------------------------------------------------------------
 # Wrapper around ckf.py: takes a *dict* of parameters, returns *dict*
 # ------------------------------------------------------------------
@@ -92,15 +185,21 @@ DEFAULT_CKF_PARAMS: Dict[str, float] = {
 def evaluate_ckf(params: dict) -> dict:
     """Run a single CKF benchmark with the supplied hyper‑parameters."""
 
+    global COMPLETED_TRIALS 
+
+        # Generate a sequential index (best-effort) for logging
+    trial_idx = COMPLETED_TRIALS + 1
+
+    # ---------- BEGIN banner ---------------------------------
+    rank        = MPI.COMM_WORLD.Get_rank()
+    start_stamp = datetime.now().strftime("%H:%M:%S.%f")[:12]
+    vprint(f"{start_stamp}  R{rank} BEGIN  trial={trial_idx}  params={params}")
+
     # Fill in any parameters that were NOT optimised with defaults
     full_params = DEFAULT_CKF_PARAMS.copy()
     full_params.update(params)
 
-    rank = MPI.COMM_WORLD.Get_rank()
-    now  = datetime.now().strftime("%H:%M:%S.%f")[:12]
-    print(f"{now}  R{rank} START", flush=True)
-    global completed
-    print(f"[worker rank {MPI.COMM_WORLD.Get_rank()}] running CKF with {params}")
+
     workdir = pathlib.Path(tempfile.mkdtemp(prefix="ckf_run_"))
     ckf_args = [
         f"--sf_{k}={int(round(v))}" if k == "maxSeedsPerSpM" else f"--sf_{k}={v}"
@@ -146,7 +245,7 @@ def evaluate_ckf(params: dict) -> dict:
             fake  = rh["fakeratio_tracks"].member("fElements")[0]
             dup   = rh["duplicateratio_tracks"].member("fElements")[0]
 
-        print(f"[DEBUG] eff={eff} fake={fake} dup={dup} run={run_time}")
+        #print(f"[DEBUG] eff={eff} fake={fake} dup={dup} run={run_time}")
 
         # composite score  (same as Optuna example)
         import math
@@ -156,11 +255,6 @@ def evaluate_ckf(params: dict) -> dict:
             k_dup, k_time = 7, 7
             penalty = fake + dup / k_dup + run_time / k_time
             score = -(eff - penalty)   # negate → MINIMIZE
-        completed += 1
-        now = datetime.now().strftime("%H:%M:%S.%f")[:12]
-        print(f"{now}  R{rank} DONE ", flush=True)
-        print(f"[R{MPI.COMM_WORLD.Get_rank()}] done → {completed}", flush=True)
-        return {"score": score}
 
     except Exception as exc:
         print("[WARN] ckf.py failed:", exc, file=sys.stderr)
@@ -168,42 +262,70 @@ def evaluate_ckf(params: dict) -> dict:
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+        COMPLETED_TRIALS += 1
+        end_stamp = datetime.now().strftime("%H:%M:%S.%f")[:12]
+        vprint(
+            f"{end_stamp}  R{rank} END    trial={trial_idx}  "
+            f"score={score:.3f}  eff={eff:.3f}  fake={fake:.3f}  dup={dup:.3f}  time={run_time:.3f}s\n"
+        )
+        
+    return {"score": score}
+
+
+
+def plot_score_vs_trial(df: pd.DataFrame, n_seed: int, outdir: Path) -> Path:
+    """Create a PNG showing inverted score vs trial number.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Optimisation history with at least the columns `trial` and `inv_score`.
+    n_seed : int
+        Number of initial random seed trials (highlighted in red).
+    outdir : Path
+        Directory in which to store the PNG.
+
+    Returns
+    -------
+    Path
+        Full path to the saved PNG file.
+    """
+    # Split masks for styling
+    seed_mask = df["trial"] < n_seed
+    success_mask = df["inv_score"] > 0.0
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(df.loc[success_mask, "trial"], df.loc[success_mask, "inv_score"], marker="o", linewidth=1.5, label="successful trials")
+    plt.scatter(df["trial"], df["inv_score"], zorder=4)
+    plt.scatter(df.loc[seed_mask, "trial"], df.loc[seed_mask, "inv_score"], color="red", zorder=5, label="seed trials")
+
+    plt.xlabel("Trial number")
+    plt.ylabel("Inverted score (higher is better)")
+    plt.title("Inverted score vs Trial number — CKF optimisation")
+    plt.legend()
+    plt.tight_layout()
+
+    png_path = outdir / "score_vs_trial.png"
+    plt.savefig(png_path, dpi=150)
+    plt.close()
+    return png_path
+
+def _print_progress(current: int, total: int, width: int = 40) -> None:
+    """Render a one-line text progress bar like  [#####-----] 12/50."""
+    fraction = current / total
+    filled   = int(width * fraction)
+    bar = "#" * filled + "-" * (width - filled)
+    # \r returns cursor to line start; flush=True forces immediate update
+    print(f"\r[{bar}] {current}/{total} trials", end="", flush=True)
+    if current == total:
+        print()   # newline when done
 
 # ------------------------------------------------------------------
 # Main optimisation loop
 # ------------------------------------------------------------------
 def main(argv=None):
-    ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--n-seed-trials", type=int, default=5,
-                    help="Number of initial random evaluations (warm-up)")
-    ap.add_argument("--n-guided-trials", type=int, default=50,
-                    help="Number of optimisation iterations *after* the seeds")
-    ap.add_argument("--output-dir", type=pathlib.Path, default=pathlib.Path("xopt_out"))
-    ap.add_argument(
-        "--opt-vars",
-        default="all",
-        help=(
-            "Comma seperated list of CKF variables to optimise. "
-            f"Choices: {', '.join(VOCS_CKF.variables.keys())}; "
-            "use 'all' to optimise every variable."
-        ),
-    )
-
-    # -------------- NEW FLAGS ----------------------------------------
-    ap.add_argument(
-        "--data-file",
-        type=pathlib.Path,
-        default=None,
-        help="ROOT file or directory produced with ACTS simulation (optional)",
-    )
-    ap.add_argument(
-        "--geometry",
-        choices=["generic", "odd"],
-        default="generic",
-        help="Detector geometry to reconstruct with",
-    )
-
-    args = ap.parse_args(argv)
+    
+    args = parse_cli_args(argv) 
 
     # ---- share geometry string across all MPI ranks ----------------
     geom_str = args.geometry if MPI.COMM_WORLD.Get_rank() == 0 else None
@@ -222,8 +344,8 @@ def main(argv=None):
 
     global OPT_VARS
     OPT_VARS = set(opt_vars)  # make visible to evaluate_ckf
-    if MPI.COMM_WORLD.Get_rank() == 0:
-        print("[rank-0] optimiser will vary →", sorted(opt_vars))
+    #if MPI.COMM_WORLD.Get_rank() == 0:
+        #print("[rank-0] optimiser will vary →", sorted(opt_vars))
     # ---------- build a VOCS subset ----------
     vocs_subset = VOCS(
         variables={k: VOCS_CKF.variables[k] for k in opt_vars},
@@ -253,8 +375,10 @@ def main(argv=None):
         X.random_evaluate(n_seed)
 
         # total guided evaluations = args.n_trials
-        while len(X.data) < n_seed + n_guided:
-            X.step() 
+        total_trials = n_seed + n_guided
+        while len(X.data) < total_trials:
+            X.step()
+            _print_progress(len(X.data), total_trials)
         # ---------- persist results --------------------------------
            # each step spawns 4 CKF runs
         csv_path = outdir / "history.csv"
@@ -262,40 +386,13 @@ def main(argv=None):
 
         with open(outdir / "xopt_state.json", "w") as fh:
             fh.write(X.model_dump_json(indent=2))
-        # ---------- plotting ---------------------------------------
+        
+        # Prepare dataframe for plotting
         df = X.data.copy().reset_index(drop=True)
         df["trial"] = df.index
-        # invert for plotting, map failed 1.0 → 0.0
         df["inv_score"] = np.where(df["score"] == 1.0, 0.0, -df["score"])
-        seed_mask = df["trial"] < n_seed
 
-        # line should connect only non‑zero points
-        line_mask = df["inv_score"] > 0.0
-        plt.figure(figsize=(8, 4))
-        plt.plot(
-            df.loc[line_mask, "trial"],
-            df.loc[line_mask, "inv_score"],
-            marker="o",
-            linewidth=1.5,
-            label="successful trials",
-        )
-        # scatter all points, colouring seeds separately
-        plt.scatter(df["trial"], df["inv_score"], color="blue", zorder=4)
-        plt.scatter(
-            df.loc[seed_mask, "trial"],
-            df.loc[seed_mask, "inv_score"],
-            color="red",
-            zorder=5,
-            label="seed trials (first 5)",
-        )
-        plt.xlabel("Trial number")
-        plt.ylabel("Inverted score (higher is better)")
-        plt.title("Inverted score vs Trial number — CKF optimisation")
-        plt.legend()
-        plt.tight_layout()
-        png_path = outdir / "score_vs_trial.png"
-        plt.savefig(png_path, dpi=150)
-        plt.close()
+        png_path = plot_score_vs_trial(df, n_seed, outdir)
 
         # ---------- console summary -------------------------------
         best_row = df.loc[df["inv_score"].idxmax()]
