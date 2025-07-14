@@ -60,6 +60,7 @@ DEFAULT_GEOMETRY = "generic"
 COMPLETED_TRIALS: int = 0  # updated inside workers
 GEOMETRY: str = DEFAULT_GEOMETRY  # broadcast from rank‑0 at runtime
 VERBOSE: bool = False             # set from CLI
+SIM_DATA_DIR: Path | None = None    # filled in main()
 
 # ------------------------------------------------------------------
 # CKF hyper‑parameter search space (bounds)
@@ -160,6 +161,15 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Detector geometry to reconstruct with.",
     )
 
+    parser.add_argument(
+    "--indir",
+    type=Path,
+    default=None,           # <- None means “user did not specify”
+    metavar="DIR",
+    help="Directory that contains the input ROOT files for ckf.py "
+         "(omit to leave ckf.py’s own default unchanged).",
+    )  
+
     # Verbosity flag
     parser.add_argument(
         "-v",
@@ -213,6 +223,9 @@ def evaluate_ckf(params: dict, verbose: bool = False):
     if GEOMETRY == "odd":
         ckf_args.append("--sf_minPt=1.0")
     cli = ["python", "ckf.py", "--nEvents=1",f"--geometry={GEOMETRY}",  f"--output={workdir}", *ckf_args]
+
+    if SIM_DATA_DIR is not None:
+        cli.insert(5, f"--indir={SIM_DATA_DIR}")  
 
     cmd = ["python", "ckf.py", "--nEvents=1",
            f"--output={workdir}", *ckf_args]
@@ -332,6 +345,16 @@ def _print_progress(current: int, total: int, width: int = 40) -> None:
 def main(argv=None):
     
     args = parse_cli_args(argv) 
+
+    global SIM_DATA_DIR
+    SIM_DATA_DIR = args.indir
+
+    # share indir path with every rank
+    indir_str = str(args.indir) if args.indir is not None else ""
+    indir_str = MPI.COMM_WORLD.bcast(indir_str, root=0)
+
+    # overwrite the global on *every* rank
+    SIM_DATA_DIR = Path(indir_str) if indir_str else None
 
     # in main(), right after you set VERBOSE = args.verbose
     rank = MPI.COMM_WORLD.Get_rank()
