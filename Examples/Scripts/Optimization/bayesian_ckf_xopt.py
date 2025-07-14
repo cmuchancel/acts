@@ -46,8 +46,6 @@ import matplotlib.pyplot as plt
 from mpi4py import MPI
 from functools import partial 
 from pathlib import Path
-#print(f"[DEBUG] world size = {MPI.COMM_WORLD.Get_size()}, rank = {MPI.COMM_WORLD.Get_rank()}")
-
 import xopt
 from xopt.vocs import VOCS
 from xopt.evaluator import Evaluator
@@ -177,20 +175,26 @@ def vprint(*args, **kwargs) -> None:  # noqa: D401 – simple wrapper
     if VERBOSE:
         print(*args, **kwargs)
 
+def _init_worker(verbose_flag: bool):
+    """Run once in every pool worker; copy the verbosity flag."""
+    global VERBOSE
+    VERBOSE = verbose_flag
 
 # ------------------------------------------------------------------
 # Wrapper around ckf.py: takes a *dict* of parameters, returns *dict*
 # ------------------------------------------------------------------
 
-def evaluate_ckf(params: dict) -> dict:
+def evaluate_ckf(params: dict, verbose: bool = False):
     """Run a single CKF benchmark with the supplied hyper‑parameters."""
 
     global COMPLETED_TRIALS 
+ 
 
-        # Generate a sequential index (best-effort) for logging
+    # Generate a sequential index (best-effort) for logging
     trial_idx = COMPLETED_TRIALS + 1
 
     # ---------- BEGIN banner ---------------------------------
+    
     rank        = MPI.COMM_WORLD.Get_rank()
     start_stamp = datetime.now().strftime("%H:%M:%S.%f")[:12]
     vprint(f"{start_stamp}  R{rank} BEGIN  trial={trial_idx}  params={params}")
@@ -245,8 +249,6 @@ def evaluate_ckf(params: dict) -> dict:
             fake  = rh["fakeratio_tracks"].member("fElements")[0]
             dup   = rh["duplicateratio_tracks"].member("fElements")[0]
 
-        #print(f"[DEBUG] eff={eff} fake={fake} dup={dup} run={run_time}")
-
         # composite score  (same as Optuna example)
         import math
         if any(math.isnan(x) or math.isinf(x) for x in [eff, fake, dup, run_time]):
@@ -257,18 +259,22 @@ def evaluate_ckf(params: dict) -> dict:
             score = -(eff - penalty)   # negate → MINIMIZE
 
     except Exception as exc:
-        print("[WARN] ckf.py failed:", exc, file=sys.stderr)
-        return {"score": 1.0}
+        if VERBOSE:
+            print("[WARN] ckf.py failed:", exc, file=sys.stderr)
+        return {"score": 1.0} 
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         COMPLETED_TRIALS += 1
         end_stamp = datetime.now().strftime("%H:%M:%S.%f")[:12]
+    if "score" in locals():        # ckf.py succeeded
         vprint(
             f"{end_stamp}  R{rank} END    trial={trial_idx}  "
-            f"score={score:.3f}  eff={eff:.3f}  fake={fake:.3f}  dup={dup:.3f}  time={run_time:.3f}s\n"
+            f"score={score:.3f}  eff={eff:.3f}  fake={fake:.3f}  "
+            f"dup={dup:.3f}  time={run_time:.3f}s"
         )
-        
+    else:                          # we bailed out in except
+        vprint(f"{end_stamp}  R{rank} FAILED trial={trial_idx}")
     return {"score": score}
 
 
@@ -327,6 +333,15 @@ def main(argv=None):
     
     args = parse_cli_args(argv) 
 
+    # in main(), right after you set VERBOSE = args.verbose
+    rank = MPI.COMM_WORLD.Get_rank()
+    verb_flag = args.verbose if rank == 0 else None
+    verb_flag = MPI.COMM_WORLD.bcast(verb_flag, root=0)
+
+    # overwrite the module-level flag on *every* rank
+    global VERBOSE
+    VERBOSE = verb_flag
+
     # ---- share geometry string across all MPI ranks ----------------
     geom_str = args.geometry if MPI.COMM_WORLD.Get_rank() == 0 else None
     geom_str = MPI.COMM_WORLD.bcast(geom_str, root=0)
@@ -344,9 +359,7 @@ def main(argv=None):
 
     global OPT_VARS
     OPT_VARS = set(opt_vars)  # make visible to evaluate_ckf
-    #if MPI.COMM_WORLD.Get_rank() == 0:
-        #print("[rank-0] optimiser will vary →", sorted(opt_vars))
-    # ---------- build a VOCS subset ----------
+
     vocs_subset = VOCS(
         variables={k: VOCS_CKF.variables[k] for k in opt_vars},
         objectives=VOCS_CKF.objectives,
@@ -358,9 +371,9 @@ def main(argv=None):
     outdir: pathlib.Path = args.output_dir
     outdir.mkdir(parents=True, exist_ok=True)
 
-    pool      = MPIPoolExecutor()                    # ← ➋ NEW LINE
-    evaluator = xopt.Evaluator(                     # ←  replace old
-        function=evaluate_ckf,
+    pool      = MPIPoolExecutor(initializer=_init_worker, initargs=(args.verbose,),)                    # ← ➋ NEW LINE
+    evaluator = xopt.Evaluator(        
+        function=evaluate_ckf,             # ←  replace old
         executor=pool
     )
     generator = UpperConfidenceBoundGenerator(
@@ -378,7 +391,8 @@ def main(argv=None):
         total_trials = n_seed + n_guided
         while len(X.data) < total_trials:
             X.step()
-            _print_progress(len(X.data), total_trials)
+            if not VERBOSE:
+                _print_progress(len(X.data), total_trials)
         # ---------- persist results --------------------------------
            # each step spawns 4 CKF runs
         csv_path = outdir / "history.csv"
