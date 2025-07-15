@@ -44,7 +44,6 @@ from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 from mpi4py import MPI
-from functools import partial 
 from pathlib import Path
 import xopt
 from xopt.vocs import VOCS
@@ -116,7 +115,6 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Optimisation hyper‑parameters
     parser.add_argument(
         "--n-seed-trials",
         type=int,
@@ -132,7 +130,6 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Number of Bayesian‑optimisation iterations after the seed phase.",
     )
 
-    # File‑system options
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -141,7 +138,6 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Directory in which to store optimiser outputs.",
     )
 
-    # Optimisation variable control
     parser.add_argument(
         "--opt-vars",
         default="all",
@@ -153,7 +149,6 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
 
-    # Reconstruction options
     parser.add_argument(
         "--geometry",
         choices=["generic", "odd"],
@@ -164,13 +159,12 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
     "--indir",
     type=Path,
-    default=None,           # <- None means “user did not specify”
+    default=None,
     metavar="DIR",
     help="Directory that contains the input ROOT files for ckf.py "
          "(omit to leave ckf.py’s own default unchanged).",
     )  
 
-    # Verbosity flag
     parser.add_argument(
         "-v",
         "--verbose",
@@ -185,17 +179,23 @@ def vprint(*args, **kwargs) -> None:  # noqa: D401 – simple wrapper
     if VERBOSE:
         print(*args, **kwargs)
 
-def _init_worker(verbose_flag: bool):
-    """Run once in every pool worker; copy the verbosity flag."""
-    global VERBOSE
+def _init_worker(verbose_flag: bool, indir_str: str, geometry: str):
+    """Run once in every pool worker; copy flags sent from rank-0."""
+    global VERBOSE, SIM_DATA_DIR, GEOMETRY
     VERBOSE = verbose_flag
+    SIM_DATA_DIR = Path(indir_str) if indir_str else None
+    GEOMETRY = geometry
 
 # ------------------------------------------------------------------
 # Wrapper around ckf.py: takes a *dict* of parameters, returns *dict*
 # ------------------------------------------------------------------
 
-def evaluate_ckf(params: dict, verbose: bool = False):
+def evaluate_ckf(params: dict):
     """Run a single CKF benchmark with the supplied hyper‑parameters."""
+
+    # safe defaults in case ckf.py crashes
+    score = 1.0
+    eff = fake = dup = run_time = float("nan")
 
     global COMPLETED_TRIALS 
  
@@ -227,10 +227,10 @@ def evaluate_ckf(params: dict, verbose: bool = False):
     if SIM_DATA_DIR is not None:
         cli.insert(5, f"--indir={SIM_DATA_DIR}")  
 
-    cmd = ["python", "ckf.py", "--nEvents=1",
-           f"--output={workdir}", *ckf_args]
-
     try:
+
+        t0 = time.perf_counter()
+        
         proc = subprocess.run(
             cli, check=True, capture_output=True, text=True
         )
@@ -280,54 +280,104 @@ def evaluate_ckf(params: dict, verbose: bool = False):
         shutil.rmtree(workdir, ignore_errors=True)
         COMPLETED_TRIALS += 1
         end_stamp = datetime.now().strftime("%H:%M:%S.%f")[:12]
-    if "score" in locals():        # ckf.py succeeded
-        vprint(
-            f"{end_stamp}  R{rank} END    trial={trial_idx}  "
-            f"score={score:.3f}  eff={eff:.3f}  fake={fake:.3f}  "
-            f"dup={dup:.3f}  time={run_time:.3f}s"
-        )
-    else:                          # we bailed out in except
-        vprint(f"{end_stamp}  R{rank} FAILED trial={trial_idx}")
+        if "score" in locals():        # ckf.py succeeded
+            vprint(
+                f"{end_stamp}  R{rank} END    trial={trial_idx}  "
+                f"score={score:.3f}  eff={eff:.3f}  fake={fake:.3f}  "
+                f"dup={dup:.3f}  time={run_time:.3f}s"
+            )
+        else:                          # we bailed out in except
+            vprint(f"{end_stamp}  R{rank} FAILED trial={trial_idx}")
     return {"score": score}
 
-
-
-def plot_score_vs_trial(df: pd.DataFrame, n_seed: int, outdir: Path) -> Path:
-    """Create a PNG showing inverted score vs trial number.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Optimisation history with at least the columns `trial` and `inv_score`.
-    n_seed : int
-        Number of initial random seed trials (highlighted in red).
-    outdir : Path
-        Directory in which to store the PNG.
+def plot_score_vs_trial_dual_autozoom(
+    df: pd.DataFrame,
+    n_seed: int,
+    outdir: Path,
+    *,
+    keep_pct: float = 0.96,          # fraction of non-zero scores to keep in frame
+    overview_fname: str = "score_vs_trial_full.png",
+    zoom_fname: str = "score_vs_trial_zoom.png",
+) -> tuple[Path, Path]:
+    """
+    Save two plots:
+    (A) overview — full y–range
+    (B) zoomed — automatically chosen so that
+        • y-min excludes all zeros (failures)
+        • y-range keeps ~`keep_pct` of positive scores
 
     Returns
     -------
-    Path
-        Full path to the saved PNG file.
+    (Path, Path)
+        Paths to the overview PNG and the zoomed PNG.
     """
-    # Split masks for styling
-    seed_mask = df["trial"] < n_seed
-    success_mask = df["inv_score"] > 0.0
+    outdir.mkdir(exist_ok=True)
 
+    # ------------------------------------------------------------------ masks
+    seed_mask   = df["trial"] < n_seed
+    guided_mask = ~seed_mask
+    best_so_far = df["inv_score"].cummax()
+
+    # ------------------------------------------------------------ un-zoomed
     plt.figure(figsize=(8, 4))
-    plt.plot(df.loc[success_mask, "trial"], df.loc[success_mask, "inv_score"], marker="o", linewidth=1.5, label="successful trials")
-    plt.scatter(df["trial"], df["inv_score"], zorder=4)
-    plt.scatter(df.loc[seed_mask, "trial"], df.loc[seed_mask, "inv_score"], color="red", zorder=5, label="seed trials")
-
+    plt.scatter(df.loc[seed_mask,   "trial"], df.loc[seed_mask,   "inv_score"],
+                marker="o", label="seed trials",   zorder=3)
+    plt.scatter(df.loc[guided_mask, "trial"], df.loc[guided_mask, "inv_score"],
+                marker="x", label="guided trials", zorder=2)
     plt.xlabel("Trial number")
     plt.ylabel("Inverted score (higher is better)")
-    plt.title("Inverted score vs Trial number — CKF optimisation")
+    plt.title("Inverted score vs Trial number — overview")
     plt.legend()
     plt.tight_layout()
-
-    png_path = outdir / "score_vs_trial.png"
-    plt.savefig(png_path, dpi=150)
+    overview_path = outdir / overview_fname
+    plt.savefig(overview_path, dpi=150)
     plt.close()
-    return png_path
+
+    # ------------------------------------------------------------- auto-zoom
+    # 1. positive (non-zero) scores only
+    pos_scores = df.loc[df["inv_score"] > 0, "inv_score"]
+    if pos_scores.empty:
+        # nothing to zoom on → just reuse overview range
+        zoom_low, zoom_high = df["inv_score"].min(), df["inv_score"].max()
+    else:
+        # 2. keep central `keep_pct` of the distribution
+        lo_q = (1 - keep_pct) / 2          # e.g. 0.02 for 96 %
+        hi_q = 1 - lo_q                    # e.g. 0.98
+        zoom_low = pos_scores.quantile(lo_q)
+        zoom_high = pos_scores.quantile(hi_q)
+
+        # add ±5 % padding
+        pad = 0.05 * (zoom_high - zoom_low)
+        zoom_low = max(zoom_low - pad, 0.0)
+        zoom_high += pad
+
+    best_val   = best_so_far.max()
+    best_trial = df.loc[df["inv_score"] == best_val, "trial"].iloc[0]
+
+    plt.figure(figsize=(8, 4))
+    plt.scatter(df.loc[seed_mask,   "trial"], df.loc[seed_mask,   "inv_score"],
+                marker="o", label="seed trials",   zorder=3)
+    plt.scatter(df.loc[guided_mask, "trial"], df.loc[guided_mask, "inv_score"],
+                marker="x", label="guided trials", zorder=2)
+    plt.step(df["trial"], best_so_far, where="post",
+             linestyle="--", linewidth=1.2, label="running best", zorder=4)
+    plt.annotate(f"Best: {best_val:.4f} (trial {best_trial})",
+                 xy=(best_trial, best_val),
+                 xytext=(0.02, 0.97), textcoords="axes fraction",
+                 va="top", fontweight="bold",
+                 bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.7),
+                 arrowprops=dict(arrowstyle="->", lw=1.0))
+    plt.xlabel("Trial number")
+    plt.ylabel("Inverted score (higher is better)")
+    plt.title("Inverted score vs Trial number — zoomed (auto)")
+    plt.ylim(zoom_low, zoom_high)
+    plt.legend()
+    plt.tight_layout()
+    zoom_path = outdir / zoom_fname
+    plt.savefig(zoom_path, dpi=150)
+    plt.close()
+
+    return overview_path, zoom_path
 
 def _print_progress(current: int, total: int, width: int = 40) -> None:
     """Render a one-line text progress bar like  [#####-----] 12/50."""
@@ -346,31 +396,19 @@ def main(argv=None):
     
     args = parse_cli_args(argv) 
 
-    global SIM_DATA_DIR
-    SIM_DATA_DIR = args.indir
+    # How many MPI ranks did the user launch?
+    world_size = MPI.COMM_WORLD.Get_size()        # 1 in serial, N under mpiexec
 
-    # share indir path with every rank
-    indir_str = str(args.indir) if args.indir is not None else ""
-    indir_str = MPI.COMM_WORLD.bcast(indir_str, root=0)
+    # Will the root rank (0) also run CKF jobs?
+    root_is_worker = True   # stays True unless you set include_self=False below
 
-    # overwrite the global on *every* rank
-    SIM_DATA_DIR = Path(indir_str) if indir_str else None
-
-    # in main(), right after you set VERBOSE = args.verbose
-    rank = MPI.COMM_WORLD.Get_rank()
-    verb_flag = args.verbose if rank == 0 else None
-    verb_flag = MPI.COMM_WORLD.bcast(verb_flag, root=0)
-
-    # overwrite the module-level flag on *every* rank
-    global VERBOSE
-    VERBOSE = verb_flag
-
-    # ---- share geometry string across all MPI ranks ----------------
-    geom_str = args.geometry if MPI.COMM_WORLD.Get_rank() == 0 else None
-    geom_str = MPI.COMM_WORLD.bcast(geom_str, root=0)
-
-    global GEOMETRY
-    GEOMETRY = geom_str
+    pool_size = world_size if root_is_worker else max(1, world_size - 1)
+    
+    # --- copy rank-0 flags into globals ---
+    global VERBOSE, SIM_DATA_DIR, GEOMETRY
+    VERBOSE = args.verbose
+    SIM_DATA_DIR = args.indir           # may be None
+    GEOMETRY = args.geometry
 
     if args.opt_vars.lower() == "all":
         opt_vars = list(VOCS_CKF.variables.keys())
@@ -394,14 +432,25 @@ def main(argv=None):
     outdir: pathlib.Path = args.output_dir
     outdir.mkdir(parents=True, exist_ok=True)
 
-    pool      = MPIPoolExecutor(initializer=_init_worker, initargs=(args.verbose,),)                    # ← ➋ NEW LINE
+    # -- main()  (remove the old broadcasts) ----------------------------
+    pool = MPIPoolExecutor(
+        initializer=_init_worker,
+        initargs=(
+            args.verbose,
+            str(args.indir) if args.indir else "",
+            args.geometry,
+        ),
+     include_self=True  
+    )
+
     evaluator = xopt.Evaluator(        
         function=evaluate_ckf,             # ←  replace old
-        executor=pool
+        executor=pool,
+        max_workers=MPI.COMM_WORLD.Get_size()  
     )
     generator = UpperConfidenceBoundGenerator(
         vocs=vocs_subset,
-        n_candidates=4
+        n_candidates=MPI.COMM_WORLD.Get_size()  
     )
 
     X = xopt.Xopt(evaluator=evaluator, generator=generator, vocs=vocs_subset)
@@ -429,15 +478,13 @@ def main(argv=None):
         df["trial"] = df.index
         df["inv_score"] = np.where(df["score"] == 1.0, 0.0, -df["score"])
 
-        png_path = plot_score_vs_trial(df, n_seed, outdir)
-
+        full_png, zoom_png = plot_score_vs_trial_dual_autozoom(df, n_seed, outdir)
         # ---------- console summary -------------------------------
         best_row = df.loc[df["inv_score"].idxmax()]
-        print(f"✅i Optimisation finished. Results in {outdir}")
+        print(f"✅ Optimisation finished. Results in {outdir}")
         print(f"Best parameters →\n{best_row.to_dict()}")
         print(f"History saved to {csv_path}")
-        print(f"Plot saved to   {png_path}")
-
+        print("Plots Saved:", full_png, "and", zoom_png)
 
 if __name__ == "__main__":  # pragma: no cover
     main()
