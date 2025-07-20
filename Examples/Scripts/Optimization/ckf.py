@@ -106,6 +106,22 @@ def getArgumentParser():
         help="Minimum pT for seeding [GeV] – overrides geometry defaults",
     )
 
+    parser.add_argument(
+        "-P", "--pythia8",
+        action="store_true",
+        help="Generate events on the fly with Pythia8 (ttbar hard-process).",
+    )
+
+    parser.add_argument(
+        "--ttbar-pu",
+        type=int,
+        default=0,
+        help="Average pile-up ⟨μ⟩ to mix into the Pythia8 ttbar sample.",
+    )
+
+    parser.add_argument("--event-number", type=int, default=0,
+                    help="index of the event to process from particles.root")
+
     return parser
 
 
@@ -131,6 +147,7 @@ def runCKFTracks(
     DeltaRMin=1.0,
     DeltaRMax=60.0,
     MinPt=0.5,
+    skipGun=False, 
 ):
     from acts.examples.simulation import (
         addParticleGun,
@@ -164,7 +181,23 @@ def runCKFTracks(
     rnd = acts.examples.RandomNumbers(seed=42)
     outputDir = Path(outputDir)
 
-    if inputParticlePath is None:
+    if inputParticlePath is not None:
+        # ① read an existing particles.root
+        acts.logging.getLogger("CKFExample").info(
+            "Reading particles from %s", inputParticlePath.resolve()
+        )
+        s.addReader(
+            RootParticleReader(
+                level=acts.logging.INFO,
+                filePath=str(inputParticlePath.resolve()),
+                outputParticles="particles_generated",
+                firstEvent=options.event_number,
+                numEvents=1,
+            )
+        )
+
+    elif not skipGun:
+        # ② fallback particle gun (only when we didn’t ask to skip it)
         addParticleGun(
             s,
             EtaConfig(-2.0, 2.0),
@@ -172,18 +205,6 @@ def runCKFTracks(
             PhiConfig(0.0, 360.0 * u.degree),
             multiplicity=2,
             rnd=rnd,
-        )
-    else:
-        acts.logging.getLogger("CKFExample").info(
-            "Reading particles from %s", inputParticlePath.resolve()
-        )
-        assert inputParticlePath.exists()
-        s.addReader(
-            RootParticleReader(
-                level=acts.logging.INFO,
-                filePath=str(inputParticlePath.resolve()),
-                outputParticles="particles_generated",
-            )
         )
 
     addFatras(
@@ -318,6 +339,33 @@ if "__main__" == __name__:
     decorators        = detector.contextDecorators()
 
     # ------------------------------------------------------------------
+    # Build a base Sequencer *first* (so we can prep Pythia8 before Fatras)
+    # ------------------------------------------------------------------
+    seq_base = acts.examples.Sequencer(
+        events=int(options.nEvts), numThreads=-1, logLevel=acts.logging.INFO, outputDir=str(Outputdir)
+    )
+
+    if options.pythia8:
+        from acts.examples.simulation import addPythia8
+        from acts.examples import RandomNumbers, GaussianVertexGenerator
+        addPythia8(
+            seq_base,
+            hardProcess=["Top:qqbar2ttbar=on"],
+            npileup=options.ttbar_pu,
+            vtxGen=GaussianVertexGenerator(
+                mean=acts.Vector4(0, 0, 0, 0),
+                stddev=acts.Vector4(
+                    0.0125 * u.mm,
+                    0.0125 * u.mm,
+                    55.5 * u.mm,
+                    5.0 * u.ns,
+                ),
+            ),
+            rnd=RandomNumbers(seed=42),
+            outputDirRoot=Path(options.outdir),
+            outputDirCsv=Path(options.outdir),
+        )
+    # ------------------------------------------------------------------
     # Resolve min‑pT cut
     # ------------------------------------------------------------------
     minPt_cut = options.sf_minPt if options.sf_minPt is not None else default_minPt
@@ -328,7 +376,7 @@ if "__main__" == __name__:
     if not inputParticlePath.exists():
         inputParticlePath = None
 
-    runCKFTracks(
+    seq = runCKFTracks(
         trackingGeometry,
         decorators,
         field=field,
@@ -348,5 +396,9 @@ if "__main__" == __name__:
         MaxPtScattering=options.sf_maxPtScattering,
         DeltaRMin=options.sf_deltaRMin,
         DeltaRMax=options.sf_deltaRMax,
-        MinPt=minPt_cut
-    ).run()
+        MinPt=minPt_cut,
+        skipGun=options.pythia8 ,
+        s = seq_base,
+    )
+        
+    seq_base.run()
