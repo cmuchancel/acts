@@ -50,6 +50,7 @@ from xopt.vocs import VOCS
 from xopt.evaluator import Evaluator
 from xopt.generators.bayesian import UpperConfidenceBoundGenerator
 from mpi4py.futures import MPIPoolExecutor
+import multiprocessing as mp 
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,7 @@ DEFAULT_GEOMETRY = "generic"
 COMPLETED_TRIALS: int = 0  # updated inside workers
 GEOMETRY: str = DEFAULT_GEOMETRY  # broadcast from rank‑0 at runtime
 VERBOSE: bool = False             # set from CLI
-SIM_DATA_DIR: Path | None = None    # filled in main()
+EVENT_Q: mp.Queue | None = None
 
 # ------------------------------------------------------------------
 # CKF hyper‑parameter search space (bounds)
@@ -82,15 +83,15 @@ VOCS_CKF = VOCS(
 # ------------------------------------------------------------------
 # Default values used whenever a variable *is not* optimised
 # ------------------------------------------------------------------
-DEFAULT_CKF_PARAMS: Dict[str, float] = {
-    "maxSeedsPerSpM": 12,
-    "cotThetaMax": 1.5,
-    "sigmaScattering": 2.0,
-    "radLengthPerSeed": 1.0,
-    "impactMax": 1.5,
+DEFAULT_CKF_PARAMS: Dict[str, float] = { 
+    "maxSeedsPerSpM": 1.0,
+    "cotThetaMax": 7.40627,
+    "sigmaScattering": 5.0,
+    "radLengthPerSeed": 0.1,
+    "impactMax": 3.0,
     "maxPtScattering": 10.0,
-    "deltaRMin": 0.5,
-    "deltaRMax": 100.0,
+    "deltaRMin": 1.0,
+    "deltaRMax": 60.0,
 }
 
 # ---------------------------------------------------------------------------
@@ -157,13 +158,9 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
-    "--indir",
-    type=Path,
-    default=None,
-    metavar="DIR",
-    help="Directory that contains the input ROOT files for ckf.py "
-         "(omit to leave ckf.py’s own default unchanged).",
-    )  
+        "--sim-data", type=Path, default=Path("."),
+        help="Directory that contains particles.root",
+    )
 
     parser.add_argument(
         "-v",
@@ -179,20 +176,22 @@ def vprint(*args, **kwargs) -> None:  # noqa: D401 – simple wrapper
     if VERBOSE:
         print(*args, **kwargs)
 
-def _init_worker(verbose_flag: bool, indir_str: str, geometry: str):
+def _init_worker(verbose_flag: bool, geometry: str):
     """Run once in every pool worker; copy flags sent from rank-0."""
-    global VERBOSE, SIM_DATA_DIR, GEOMETRY
+    global VERBOSE,  GEOMETRY
     VERBOSE = verbose_flag
-    SIM_DATA_DIR = Path(indir_str) if indir_str else None
     GEOMETRY = geometry
 
 # ------------------------------------------------------------------
 # Wrapper around ckf.py: takes a *dict* of parameters, returns *dict*
 # ------------------------------------------------------------------
 
+METRICS_LOG = Path("metrics_sidecar.csv")
+
+
 def evaluate_ckf(params: dict):
     """Run a single CKF benchmark with the supplied hyper‑parameters."""
-
+    idx = EVENT_Q.get() 
     # safe defaults in case ckf.py crashes
     score = 1.0
     eff = fake = dup = run_time = float("nan")
@@ -222,10 +221,10 @@ def evaluate_ckf(params: dict):
 
     if GEOMETRY == "odd":
         ckf_args.append("--sf_minPt=1.0")
-    cli = ["python", "ckf.py", "--nEvents=1",f"--geometry={GEOMETRY}",  f"--output={workdir}", *ckf_args]
+    cli = ["python", "ckf.py", "--nEvents=1",f"--geometry={GEOMETRY}",  f"--output={workdir}",         f"--event-number={idx}",  *ckf_args]
 
-    if SIM_DATA_DIR is not None:
-        cli.insert(5, f"--indir={SIM_DATA_DIR}")  
+    if SIM_DIR is not None:
+        cli.insert(3, f"--indir={SIM_DIR}")  
 
     try:
 
@@ -261,6 +260,12 @@ def evaluate_ckf(params: dict):
             eff   = rh["eff_tracks"].member("fElements")[0]
             fake  = rh["fakeratio_tracks"].member("fElements")[0]
             dup   = rh["duplicateratio_tracks"].member("fElements")[0]
+
+        # ----- NEW: append one line to the side-car CSV -----------------
+        # all ranks can open in append mode safely (each write ≤4096 B on POSIX)
+        with METRICS_LOG.open("a") as fh:
+            fh.write(f"{COMPLETED_TRIALS},{eff},{fake},{dup},{run_time}\n")
+    # ----------------------------------------------------------------
 
         # composite score  (same as Optuna example)
         import math
@@ -379,6 +384,61 @@ def plot_score_vs_trial_dual_autozoom(
 
     return overview_path, zoom_path
 
+# ------------------------------------------------------------------
+# Convenience:  1-liner for any metric -----------------------------
+# ------------------------------------------------------------------
+def _plot_metric_vs_trial(
+    df: pd.DataFrame,
+    metric: str,
+    n_seed: int,
+    outdir: Path,
+    *,
+    fname: str | None = None,
+    y_label: str | None = None,
+    title: str | None = None,
+    zoom: tuple[float, float] | None = None,   # (ymin,ymax)  – omit for full range
+) -> Path:
+    """
+    Scatter metric (y) vs trial (x).  Colours: red = seed trials, blue = guided.
+
+    Parameters
+    ----------
+    df : pd.DataFrame   – expects 'trial' and `<metric>` columns already present
+    metric : str        – one of {'eff', 'fake', 'dup', 'run_time'}
+    n_seed : int        – number of seed trials
+    outdir : Path
+    fname  : str | None – filename (PNG).  Defaults to f'{metric}_vs_trial.png'
+    y_label, title : str | None – labels to override sensible defaults
+    zoom   : (float,float)|None – y-range override (min,max)
+    """
+    outdir.mkdir(exist_ok=True)
+
+    if fname is None:
+        fname = f"{metric}_vs_trial.png"
+    if y_label is None:
+        y_label = metric.replace("_", " ").capitalize()
+    if title is None:
+        title = f"{y_label} vs Trial number"
+
+    seed_mask   = df["trial"] < n_seed
+
+    plt.figure(figsize=(8, 4))
+    plt.scatter(df.loc[seed_mask,   "trial"], df.loc[seed_mask,   metric],
+                marker="o",  color="red",  label="seed trials",   zorder=3)
+    plt.scatter(df.loc[~seed_mask,  "trial"], df.loc[~seed_mask,  metric],
+                marker="x",  color="royalblue", label="guided trials", zorder=2)
+    plt.xlabel("Trial number")
+    plt.ylabel(y_label)
+    plt.title(title)
+    plt.legend()
+    if zoom is not None:
+        plt.ylim(*zoom)
+    plt.tight_layout()
+    path = outdir / fname
+    plt.savefig(path, dpi=150)
+    plt.close()
+    return path
+
 def _print_progress(current: int, total: int, width: int = 40) -> None:
     """Render a one-line text progress bar like  [#####-----] 12/50."""
     fraction = current / total
@@ -393,6 +453,8 @@ def _print_progress(current: int, total: int, width: int = 40) -> None:
 # Main optimisation loop
 # ------------------------------------------------------------------
 def main(argv=None):
+
+    global EVENT_Q, SIM_DIR
     
     args = parse_cli_args(argv) 
 
@@ -405,10 +467,16 @@ def main(argv=None):
     pool_size = world_size if root_is_worker else max(1, world_size - 1)
     
     # --- copy rank-0 flags into globals ---
-    global VERBOSE, SIM_DATA_DIR, GEOMETRY
-    VERBOSE = args.verbose
-    SIM_DATA_DIR = args.indir           # may be None
+    global VERBOSE,  GEOMETRY
+    VERBOSE = args.verbose           # may be None
     GEOMETRY = args.geometry
+
+    # initialise event queue ------------------------------------------------
+    SIM_DIR = args.sim_data                             # >>> ADD >>> 7/8
+    n_evt   = uproot.open(SIM_DIR / "particles.root")["events"].num_entries
+    EVENT_Q = mp.Queue()
+    for i in range(n_evt):
+        EVENT_Q.put(i) 
 
     if args.opt_vars.lower() == "all":
         opt_vars = list(VOCS_CKF.variables.keys())
@@ -437,7 +505,6 @@ def main(argv=None):
         initializer=_init_worker,
         initargs=(
             args.verbose,
-            str(args.indir) if args.indir else "",
             args.geometry,
         ),
      include_self=True  
@@ -479,6 +546,22 @@ def main(argv=None):
         df["inv_score"] = np.where(df["score"] == 1.0, 0.0, -df["score"])
 
         full_png, zoom_png = plot_score_vs_trial_dual_autozoom(df, n_seed, outdir)
+
+        # --------------------------------------------
+        # Load the side-car metrics and merge on trial
+        # --------------------------------------------
+        ##metrics_df = pd.read_csv(
+        ##    METRICS_LOG,
+        ##    names=["trial", "eff", "fake", "dup", "run_time"]
+        ##)
+
+        ##df = X.data.copy().reset_index(drop=True)
+        ##df["trial"] = df.index                 # keep as 0 … N-1
+        ##df = df.merge(metrics_df, on="trial")
+
+       ##for m in ("eff", "fake", "dup", "run_time"):
+            ##_plot_metric_vs_trial(df, m, n_seed, outdir)
+
         # ---------- console summary -------------------------------
         best_row = df.loc[df["inv_score"].idxmax()]
         print(f"✅ Optimisation finished. Results in {outdir}")
