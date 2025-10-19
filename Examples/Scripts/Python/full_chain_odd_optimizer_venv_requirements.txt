@@ -1,0 +1,11 @@
+Package         Version
+--------------- -------
+botorch         0.14.0
+gpytorch        1.14
+jaxtyping       0.3.2
+linear-operator 0.6
+pyre-extensions 0.0.32
+pyro-api        0.1.2
+pyro-ppl        1.9.1
+wadler_lindig   0.1.7
+xopt            2.6.4
