@@ -10,7 +10,7 @@ This document explains how to run the CKF Bayesian optimizer, what each configur
    ```bash
    lsetup "views LCG_107 x86_64-el9-gcc13-opt"
    ```
-2. Activate (or create) the overlay virtual environment that carries the extra Python packages listed in `venv_requirements.txt`:
+2. Activate (or create) the overlay virtual environment that carries the extra Python packages listed in `full_chain_odd_optimizer_venv_requirements.txt`:
    ```bash
    python3 -m venv ~/acts-opt          # run once
    source ~/acts-opt/bin/activate
