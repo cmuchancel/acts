@@ -68,8 +68,8 @@ ActsExamples::RootMaterialDecorator::RootMaterialDecorator(
     throw std::ios_base::failure("Could not open '" + m_cfg.fileName + "'");
   }
 
-  Acts::RootMaterialMapIo accessor(m_cfg.accessorConfig,
-                                   m_logger->clone("RootMaterialMapIo"));
+  ActsPlugins::RootMaterialMapIo accessor(m_cfg.accessorConfig,
+                                          m_logger->clone("RootMaterialMapIo"));
   auto [surfaceMaps, volumeMaps] =
       accessor.read(*m_inputFile, m_cfg.accessorOptions);
 
@@ -140,7 +140,7 @@ ActsExamples::RootMaterialDecorator::RootMaterialDecorator(
             (min != nullptr) && (max != nullptr)) {
           // Dimension of the grid
           int dim = n->GetNbinsX();
-          // Now reconstruct the bin untilities
+          // Now reconstruct the bin utilities
           Acts::BinUtility bUtility;
           for (int ib = 1; ib < dim + 1; ++ib) {
             std::size_t nbins = static_cast<std::size_t>(n->GetBinContent(ib));

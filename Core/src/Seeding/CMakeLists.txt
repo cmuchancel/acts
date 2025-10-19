@@ -1,1 +1,8 @@
-target_sources(ActsCore PRIVATE EstimateTrackParamsFromSeed.cpp)
+target_sources(
+    ActsCore
+    PRIVATE
+        EstimateTrackParamsFromSeed.cpp
+        CompSpacePointAuxiliaries.cpp
+        CompositeSpacePointLineFitter.cpp
+        FastStrawLineFitter.cpp
+)

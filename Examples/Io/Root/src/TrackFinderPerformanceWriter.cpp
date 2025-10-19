@@ -337,15 +337,15 @@ ProcessCode TrackFinderPerformanceWriter::writeT(
     }
 
     // Fill efficiency plots
-    m_effPlotTool.fill(m_effPlotCache, particle.initial(), minDeltaR,
+    m_effPlotTool.fill(m_effPlotCache, particle.initialState(), minDeltaR,
                        isReconstructed);
     // Fill number of duplicated tracks for this particle
-    m_duplicationPlotTool.fill(m_duplicationPlotCache, particle.initial(),
+    m_duplicationPlotTool.fill(m_duplicationPlotCache, particle.initialState(),
                                nMatchedTracks - 1);
 
     // Fill number of reconstructed/truth-matched/fake tracks for this particle
-    m_fakePlotTool.fill(m_fakePlotCache, particle.initial(), nMatchedTracks,
-                        nFakeTracks);
+    m_fakePlotTool.fill(m_fakePlotCache, particle.initialState(),
+                        nMatchedTracks, nFakeTracks);
 
     m_nTotalParticles += 1;
   }
@@ -356,7 +356,7 @@ ProcessCode TrackFinderPerformanceWriter::writeT(
       auto particleId = particle.particleId();
 
       m_treeEventNr = ctx.eventNumber;
-      m_treeParticleId = particleId.value();
+      m_treeParticleId = particleId.asVector();
 
       m_treeIsMatched = false;
       if (auto imatched = particleTrackMatching.find(particleId);

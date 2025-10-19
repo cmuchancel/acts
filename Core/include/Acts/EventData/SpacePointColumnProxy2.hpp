@@ -10,12 +10,13 @@
 
 #include "Acts/EventData/Types.hpp"
 #include "Acts/Utilities/TypeTraits.hpp"
+#include "Acts/Utilities/detail/ContainerSubset.hpp"
 
 #include <cassert>
 #include <span>
 #include <vector>
 
-namespace Acts::Experimental {
+namespace Acts {
 
 class SpacePointContainer2;
 
@@ -24,12 +25,19 @@ class SpacePointContainer2;
 template <typename T, bool read_only>
 class SpacePointColumnProxy {
  public:
+  /// Flag indicating whether this space point column proxy is read-only
   constexpr static bool ReadOnly = read_only;
+  /// Type alias for space point index type
   using Index = SpacePointIndex2;
+  /// Type alias for space point index range type
   using IndexRange = SpacePointIndexRange2;
+  /// Type alias for space point index subset type
   using IndexSubset = SpacePointIndexSubset2;
+  /// Type alias for column value type
   using Value = T;
+  /// Type alias for container type (const if read-only)
   using Container = const_if_t<ReadOnly, SpacePointContainer2>;
+  /// Type alias for column container type (const if read-only)
   using Column = const_if_t<ReadOnly, std::vector<Value>>;
 
   /// Constructs a space point column proxy for the given container and column.
@@ -133,116 +141,30 @@ class SpacePointColumnProxy {
     return data()[index];
   }
 
-  class Subset {
+  class Subset : public detail::ContainerSubset<Subset, Subset, Column, Value,
+                                                Index, ReadOnly> {
    public:
-    class Iterator {
-     public:
-      using SubsetIterator = IndexSubset::iterator;
+    using Base =
+        detail::ContainerSubset<Subset, Subset, Column, Value, Index, ReadOnly>;
 
-      using value_type = T;
-      using difference_type = std::ptrdiff_t;
-
-      using iterator_category = std::random_access_iterator_tag;
-      using iterator_concept = std::random_access_iterator_tag;
-
-      constexpr Iterator() noexcept = default;
-      constexpr Iterator(Column &column, SubsetIterator iterator) noexcept
-          : m_column(&column), m_iterator(iterator) {}
-
-      constexpr value_type operator*() const noexcept {
-        return (*m_column)[*m_iterator];
-      }
-      constexpr value_type operator[](difference_type n) const noexcept {
-        return (*m_column)[m_iterator[n]];
-      }
-
-      constexpr Iterator &operator++() noexcept {
-        ++m_iterator;
-        return *this;
-      }
-      constexpr Iterator operator++(int) noexcept {
-        auto tmp = *this;
-        ++(*this);
-        return tmp;
-      }
-      constexpr Iterator &operator--() noexcept {
-        --m_iterator;
-        return *this;
-      }
-      constexpr Iterator operator--(int) noexcept {
-        auto tmp = *this;
-        --(*this);
-        return tmp;
-      }
-
-      constexpr Iterator &operator+=(difference_type n) noexcept {
-        m_iterator += n;
-        return *this;
-      }
-      constexpr Iterator &operator-=(difference_type n) noexcept {
-        m_iterator -= n;
-        return *this;
-      }
-
-     private:
-      Column *m_column{};
-      SubsetIterator m_iterator{};
-
-      friend constexpr Iterator operator+(Iterator it,
-                                          difference_type n) noexcept {
-        return it += n;
-      }
-
-      friend constexpr Iterator operator+(difference_type n,
-                                          Iterator it) noexcept {
-        return it += n;
-      }
-
-      friend constexpr Iterator operator-(Iterator it,
-                                          difference_type n) noexcept {
-        return it -= n;
-      }
-
-      friend constexpr difference_type operator-(const Iterator &lhs,
-                                                 const Iterator &rhs) noexcept {
-        return lhs.m_iterator - rhs.m_iterator;
-      }
-
-      friend constexpr auto operator<=>(const Iterator &a,
-                                        const Iterator &b) noexcept {
-        return a.m_iterator <=> b.m_iterator;
-      }
-      friend constexpr bool operator==(const Iterator &a,
-                                       const Iterator &b) noexcept {
-        return a.m_iterator == b.m_iterator;
-      }
-    };
-    using iterator = Iterator;
-
-    constexpr Subset(Column &column, const IndexSubset &subset) noexcept
-        : m_column(&column), m_subset(subset) {}
-
-    constexpr Container &column() const noexcept { return *m_column; }
-    constexpr const IndexSubset &subset() const noexcept { return m_subset; }
-
-    constexpr std::size_t size() const noexcept { return m_subset.size(); }
-    constexpr bool empty() const noexcept { return size() == 0; }
-
-    constexpr auto front() const noexcept { return column()[m_subset.front()]; }
-    constexpr auto back() const noexcept { return column()[m_subset.back()]; }
-
-    constexpr iterator begin() const noexcept {
-      return iterator(*m_column, m_subset.begin());
-    }
-    constexpr iterator end() const noexcept {
-      return iterator(*m_column, m_subset.end());
-    }
-
-   private:
-    Column *m_column{};
-    IndexSubset m_subset{};
+    using Base::Base;
   };
 
+  /// Creates a subset view of this space point column based on provided
+  /// indices.
+  ///
+  /// This method creates a subset proxy that provides access to only the space
+  /// points at the indices specified in the IndexSubset. The subset maintains a
+  /// reference to the original column data without copying, enabling efficient
+  /// access to selected space points for filtering, clustering, or other
+  /// operations.
+  ///
+  /// @param subset The index subset specifying which space points to include
+  /// @return A subset proxy providing access to the selected space points
+  ///
+  /// @note The returned subset shares data with the original column
+  /// @note The subset remains valid only as long as the original column exists
+  /// @note This operation does not copy data, providing efficient subset access
   Subset subset(const IndexSubset &subset) const noexcept {
     return Subset(*m_column, subset);
   }
@@ -267,4 +189,4 @@ using ConstSpacePointColumnProxy = SpacePointColumnProxy<T, true>;
 template <typename T>
 using MutableSpacePointColumnProxy = SpacePointColumnProxy<T, false>;
 
-}  // namespace Acts::Experimental
+}  // namespace Acts
