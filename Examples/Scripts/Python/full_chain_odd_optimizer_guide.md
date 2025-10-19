@@ -90,7 +90,7 @@ Parameters not actively optimized revert to the defaults in `DEFAULT_CKF_PARAMS`
 By default the script performs **single-objective** optimization. Each trial evaluates:
 
 \[
-score = -efficiency - \{fakerate} + duplicaterate/K + runtime/K
+score = -efficiency - (fakerate + duplicaterate/K + runtime/K)
 \]
 
 - `K` (set via `--k-value`, default 5.0) trades off duplication and runtime penalties against efficiency.  
